@@ -24,7 +24,7 @@ When built with `-DGGML_RPC_RDMA=ON`, the RPC backend auto-negotiates RDMA trans
 | ------- | --------- | --------------------------------------------------- |
 | Linux   | Supported | Requires `rdma-core` / `libibverbs-dev`             |
 | Windows | N/A       | RDMA code not compiled; TCP-only RPC works normally |
-| macOS   | N/A       | RDMA code not compiled; TCP-only RPC works normally |
+| macOS   | Supported | Thunderbolt 5 RDMA via dlopen. Requires macOS 26.2+, SDK 26.2+ |
 
 
 ## Hardware
@@ -36,6 +36,7 @@ RDMA transport requires RoCEv2-capable NICs on both nodes. Tested hardware:
 | -------------------------------------- | ---------- | --------- |
 | Mellanox ConnectX-4 Lx (MT27710) 25GbE | 25 Gbps    | Supported |
 | Mellanox ConnectX-6 Lx (MT2894) 25GbE  | 25 Gbps    | Supported |
+| Apple M4 Pro (Thunderbolt 5, macOS)    | 120 Gbps   | Compile-verified |
 
 
 Other RoCEv2-capable NICs (ConnectX-5/7, Broadcom NetXtreme-E, etc.) should work but are untested. Mixed NIC generations across nodes are supported.
@@ -66,6 +67,17 @@ cmake -B build \
 cmake --build build --target rpc-server llama-bench -j$(nproc)
 ```
 
+On macOS, no additional dependencies are needed — `librdma.dylib` is loaded at runtime:
+
+```bash
+cmake -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_RPC=ON \
+  -DGGML_RPC_RDMA=ON
+
+cmake --build build --target rpc-server llama-cli -j$(sysctl -n hw.ncpu)
+```
+
 ### Dependencies
 
 Requires `libibverbs-dev` (part of `rdma-core`):
@@ -79,6 +91,29 @@ sudo dnf install libibverbs-devel rdma-core-devel
 ```
 
 This is an optional dependency. Without `-DGGML_RPC_RDMA=ON`, the build produces a standard TCP-only binary with no RDMA code or libibverbs linkage.
+
+### macOS (Thunderbolt 5)
+
+Requires macOS Tahoe 26.2 or later with Thunderbolt 5 hardware on both machines.
+
+**Prerequisites:**
+1. Both Macs must run macOS 26.2+ with Thunderbolt 5 ports (M4 family or later)
+2. Connect with a Thunderbolt 5 (or USB4) cable
+3. **Disable Thunderbolt Bridge** — it conflicts with RDMA:
+
+```bash
+# Check if Thunderbolt Bridge is active
+networksetup -listnetworkserviceorder | grep -i "thunderbolt bridge"
+
+# Disable it (requires admin)
+sudo networksetup -setnetworkserviceenabled "Thunderbolt Bridge" off
+```
+
+4. Enable RDMA access via Recovery OS if prompted (see Apple documentation)
+
+No compile-time dependencies are needed on macOS. The RDMA library (`librdma.dylib`) is loaded at runtime via `dlopen`. If the library is unavailable or no RDMA devices are found, the connection uses TCP silently.
+
+**Reference:** [EXO project's Thunderbolt setup](https://github.com/exo-explore/exo/blob/main/tmp/set_rdma_network_config.sh) for advanced network configuration.
 
 ## Usage
 
@@ -139,4 +174,19 @@ GID entries with `fe80::` prefix are link-local (InfiniBand). Look for entries w
 - If using a Linux bridge, set `GGML_RDMA_DEV` and `GGML_RDMA_GID` explicitly
 - Check that RoCEv2 is enabled on the NIC port
 - Enable debug logging with `GGML_RPC_DEBUG=1` to see probe/activate messages
+
+### macOS: Verify RDMA is available
+
+```bash
+# Check kernel extensions are loaded
+kextstat | grep -i rdma
+
+# Expected output (two kexts):
+#   com.apple.iokit.IORDMAFamily
+#   com.apple.driver.AppleThunderboltRDMA
+```
+
+### macOS: Thunderbolt Bridge conflicts
+
+If RDMA devices are not found, ensure Thunderbolt Bridge is disabled. The bridge claims Thunderbolt interfaces for standard Ethernet, preventing the RDMA transport from using them.
 

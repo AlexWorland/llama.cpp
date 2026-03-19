@@ -97,7 +97,7 @@ By default, the cache is stored in the `$HOME/.cache/llama.cpp/rpc` directory an
 
 ### RDMA transport
 
-On Linux systems with RoCEv2-capable NICs (e.g. Mellanox ConnectX), the RPC backend can use RDMA instead of TCP for lower latency and higher throughput. Build with `-DGGML_RPC_RDMA=ON` and the transport is negotiated automatically -- no changes to command-line usage are required.
+On Linux systems with RoCEv2-capable NICs (e.g. Mellanox ConnectX) or macOS systems with Thunderbolt 5, the RPC backend can use RDMA instead of TCP for lower latency and higher throughput. Build with `-DGGML_RPC_RDMA=ON` and the transport is negotiated automatically -- no changes to command-line usage are required.
 
 See [docs/backend/RPC-RDMA.md](/docs/backend/RPC-RDMA.md) for setup, hardware requirements, and configuration details.
 
