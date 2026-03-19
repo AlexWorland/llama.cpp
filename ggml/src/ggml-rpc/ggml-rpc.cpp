@@ -37,6 +37,18 @@
 #  ifndef _WIN32
 #    include <poll.h>
 #  endif
+#  ifdef GGML_RPC_RDMA_DYNLOAD
+#    include "rdma-dynload.h"
+#  endif
+// Platform compatibility
+#  ifdef __APPLE__
+#    ifndef CLOCK_MONOTONIC_COARSE
+#      define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC
+#    endif
+#    ifndef POLLRDHUP
+#      define POLLRDHUP 0  // macOS: rely on POLLHUP | POLLERR instead
+#    endif
+#  endif
 #endif // GGML_RPC_RDMA
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
@@ -64,6 +76,14 @@ typedef int sockfd_t;
 // cross-platform socket
 
 #ifdef GGML_RPC_RDMA
+
+// Dispatch: dynload (dlopen) vs compile-time linkage
+#ifdef GGML_RPC_RDMA_DYNLOAD
+#  define IBV(fn, ...) rdma_lib().fn_##fn(__VA_ARGS__)
+#else
+#  define IBV(fn, ...) ibv_##fn(__VA_ARGS__)
+#endif
+
 struct rdma_conn {
     struct ibv_context * ctx = nullptr;
     struct ibv_pd * pd  = nullptr;
@@ -95,15 +115,15 @@ struct rdma_conn {
     }
 
     ~rdma_conn() {
-        if (tx_mr) ibv_dereg_mr(tx_mr);
-        if (rx_mr) ibv_dereg_mr(rx_mr);
+        if (tx_mr) IBV(dereg_mr, tx_mr);
+        if (rx_mr) IBV(dereg_mr, rx_mr);
         free(tx_buf);
         free(rx_buf);
-        if (qp)  ibv_destroy_qp(qp);
-        if (scq) ibv_destroy_cq(scq);
-        if (rcq) ibv_destroy_cq(rcq);
-        if (pd)  ibv_dealloc_pd(pd);
-        if (ctx) ibv_close_device(ctx);
+        if (qp)  IBV(destroy_qp, qp);
+        if (scq) IBV(destroy_cq, scq);
+        if (rcq) IBV(destroy_cq, rcq);
+        if (pd)  IBV(dealloc_pd, pd);
+        if (ctx) IBV(close_device, ctx);
     }
 };
 #endif // GGML_RPC_RDMA
@@ -541,7 +561,7 @@ static inline bool rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc, int tcp_fd 
         if (n > 0) {
             if (wc->status != IBV_WC_SUCCESS) {
                 GGML_LOG_ERROR("RDMA CQ wc error: status=%d (%s) vendor_err=0x%x\n",
-                    wc->status, ibv_wc_status_str(wc->status), wc->vendor_err);
+                    wc->status, IBV(wc_status_str, wc->status), wc->vendor_err);
             }
             return wc->status == IBV_WC_SUCCESS;
         }
@@ -642,7 +662,19 @@ struct rdma_local_info {
     enum ibv_mtu path_mtu;
 };
 
+static void * rdma_page_alloc(size_t alignment, size_t size) {
+    void * ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, size) != 0) return nullptr;
+    return ptr;
+}
+
 static rdma_conn * rdma_probe(sockfd_t tcp_fd, rdma_local_info * out) {
+#ifdef GGML_RPC_RDMA_DYNLOAD
+    if (!rdma_lib().load()) {
+        LOG_DBG("RDMA dynload: library not available, staying on TCP\n");
+        return nullptr;
+    }
+#endif
     const char * dev_env = std::getenv("GGML_RDMA_DEV");
     const char * gid_env = std::getenv("GGML_RDMA_GID");
 
@@ -654,7 +686,7 @@ static rdma_conn * rdma_probe(sockfd_t tcp_fd, rdma_local_info * out) {
 
     const uint8_t ib_port = 1;
     int num_devs = 0;
-    struct ibv_device ** devs = ibv_get_device_list(&num_devs);
+    struct ibv_device ** devs = IBV(get_device_list, &num_devs);
     if (!devs || num_devs == 0) return nullptr;
 
     struct ibv_context * ibctx = nullptr;
@@ -662,20 +694,25 @@ static rdma_conn * rdma_probe(sockfd_t tcp_fd, rdma_local_info * out) {
     int gid_idx = gid_env ? atoi(gid_env) : -1;
 
     for (int d = 0; d < num_devs; d++) {
-        const char * dn = ibv_get_device_name(devs[d]);
+        const char * dn = IBV(get_device_name, devs[d]);
         if (dev_env && strcmp(dev_env, dn) != 0) continue;
 
-        struct ibv_context * ctx = ibv_open_device(devs[d]);
+        struct ibv_context * ctx = IBV(open_device, devs[d]);
         if (!ctx) continue;
 
         struct ibv_port_attr pa;
-        if (ibv_query_port(ctx, ib_port, &pa) != 0) { ibv_close_device(ctx); continue; }
+#ifdef GGML_RPC_RDMA_DYNLOAD
+        if (rdma_lib().fn_query_port(ctx, ib_port, (struct _compat_ibv_port_attr *)&pa) != 0) {
+#else
+        if (ibv_query_port(ctx, ib_port, &pa) != 0) {
+#endif
+            IBV(close_device, ctx); continue; }
 
         int found_gid = gid_idx;
         if (found_gid < 0) {
             for (int i = 0; i < pa.gid_tbl_len; i++) {
                 union ibv_gid g;
-                if (ibv_query_gid(ctx, ib_port, i, &g) != 0) continue;
+                if (IBV(query_gid, ctx, ib_port, i, &g) != 0) continue;
                 if (g.raw[10] != 0xff || g.raw[11] != 0xff) continue;
                 uint32_t ip;
                 memcpy(&ip, &g.raw[12], 4);
@@ -693,9 +730,9 @@ static rdma_conn * rdma_probe(sockfd_t tcp_fd, rdma_local_info * out) {
             out->path_mtu = pa.active_mtu;
             break;
         }
-        ibv_close_device(ctx);
+        IBV(close_device, ctx);
     }
-    ibv_free_device_list(devs);
+    IBV(free_device_list, devs);
     if (!ibctx) return nullptr;
 
     out->ib_port = ib_port;
@@ -704,11 +741,11 @@ static rdma_conn * rdma_probe(sockfd_t tcp_fd, rdma_local_info * out) {
     auto * c = new rdma_conn();
     c->ctx = ibctx;
 
-    c->pd = ibv_alloc_pd(ibctx);
+    c->pd = IBV(alloc_pd, ibctx);
     if (!c->pd) { delete c; return nullptr; }
 
-    c->scq = ibv_create_cq(ibctx, 16, nullptr, nullptr, 0);
-    c->rcq = ibv_create_cq(ibctx, RDMA_RX_DEPTH + 4, nullptr, nullptr, 0);
+    c->scq = IBV(create_cq, ibctx, 16, nullptr, nullptr, 0);
+    c->rcq = IBV(create_cq, ibctx, RDMA_RX_DEPTH + 4, nullptr, nullptr, 0);
     if (!c->scq || !c->rcq) { delete c; return nullptr; }
 
     struct ibv_qp_init_attr qia = {};
@@ -721,21 +758,21 @@ static rdma_conn * rdma_probe(sockfd_t tcp_fd, rdma_local_info * out) {
     qia.cap.max_recv_sge    = 1;
     qia.cap.max_inline_data = 256;
 
-    c->qp = ibv_create_qp(c->pd, &qia);
+    c->qp = IBV(create_qp, c->pd, &qia);
     if (!c->qp) { delete c; return nullptr; }
     c->max_inline = qia.cap.max_inline_data;
 
-    c->tx_buf = aligned_alloc(4096, RDMA_CHUNK);
-    c->rx_buf = aligned_alloc(4096, (size_t)RDMA_RX_DEPTH * RDMA_CHUNK);
+    c->tx_buf = rdma_page_alloc(4096, RDMA_CHUNK);
+    c->rx_buf = rdma_page_alloc(4096, (size_t)RDMA_RX_DEPTH * RDMA_CHUNK);
     if (!c->tx_buf || !c->rx_buf) { delete c; return nullptr; }
 
-    c->tx_mr = ibv_reg_mr(c->pd, c->tx_buf, RDMA_CHUNK, IBV_ACCESS_LOCAL_WRITE);
-    c->rx_mr = ibv_reg_mr(c->pd, c->rx_buf, (size_t)RDMA_RX_DEPTH * RDMA_CHUNK,
+    c->tx_mr = IBV(reg_mr, c->pd, c->tx_buf, RDMA_CHUNK, IBV_ACCESS_LOCAL_WRITE);
+    c->rx_mr = IBV(reg_mr, c->pd, c->rx_buf, (size_t)RDMA_RX_DEPTH * RDMA_CHUNK,
                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!c->tx_mr || !c->rx_mr) { delete c; return nullptr; }
 
     union ibv_gid local_gid;
-    ibv_query_gid(ibctx, ib_port, gid_idx, &local_gid);
+    IBV(query_gid, ibctx, ib_port, gid_idx, &local_gid);
 
     out->qpn = c->qp->qp_num;
     out->psn = c->qp->qp_num & 0xffffff;
@@ -757,7 +794,7 @@ static bool rdma_activate(rdma_conn * c, const rdma_local_info * local,
         a.port_num        = local->ib_port;
         a.pkey_index      = 0;
         a.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
-        if (ibv_modify_qp(c->qp, &a,
+        if (IBV(modify_qp, c->qp, &a,
                 IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
             return false;
         }
@@ -782,7 +819,7 @@ static bool rdma_activate(rdma_conn * c, const rdma_local_info * local,
         a.ah_attr.grh.sgid_index = local->gid_idx;
         a.ah_attr.dlid       = 0;
         a.ah_attr.port_num   = local->ib_port;
-        if (ibv_modify_qp(c->qp, &a,
+        if (IBV(modify_qp, c->qp, &a,
                 IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
                 IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER) != 0) {
             return false;
@@ -798,7 +835,7 @@ static bool rdma_activate(rdma_conn * c, const rdma_local_info * local,
         a.rnr_retry    = 7;
         a.sq_psn       = local->psn;
         a.max_rd_atomic = 1;
-        if (ibv_modify_qp(c->qp, &a,
+        if (IBV(modify_qp, c->qp, &a,
                 IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
                 IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC) != 0) {
             return false;
