@@ -723,6 +723,25 @@ static rdma_conn * rdma_probe(sockfd_t tcp_fd, rdma_local_info * out) {
                 }
             }
         }
+        // Fallback: if no IPv4-mapped GID found (e.g. Thunderbolt RDMA),
+        // accept the first non-zero GID. The Thunderbolt provider handles
+        // routing internally without IP-based GID mapping.
+        // Ref: Apple macOS 26.2 RDMA over Thunderbolt, EXO project
+        if (found_gid < 0) {
+            for (int i = 0; i < pa.gid_tbl_len; i++) {
+                union ibv_gid g;
+                if (IBV(query_gid, ctx, ib_port, i, &g) != 0) continue;
+                bool is_zero = true;
+                for (int b = 0; b < 16; b++) {
+                    if (g.raw[b] != 0) { is_zero = false; break; }
+                }
+                if (!is_zero) {
+                    found_gid = i;
+                    LOG_DBG("RDMA probe: using non-RoCE GID index %d (Thunderbolt?)\n", i);
+                    break;
+                }
+            }
+        }
         if (found_gid >= 0) {
             ibctx = ctx;
             gid_idx = found_gid;
